@@ -1,0 +1,81 @@
+# ==== 本机诊断与私有材料：永不入库 ====
+P0-BRIEF.md
+ci-submit.sh
+private/
+private/**
+!private/.gitkeep
+
+# 本机报告 / 抓取 / 导出
+*.local.md
+*-local.md
+diagnostic*
+diag-*.*
+compat-local*
+*.dump
+*.trace
+*.jsonl
+
+# ==== 凭据 / 密钥 / 签名 ====
+*.key
+*.pem
+*.p12
+*.jks
+*.keystore
+*.pepk
+keystore.properties
+secrets.properties
+local.properties
+signing*.properties
+*.env
+.env
+.env.*
+agent.env
+creds*.txt
+*token*.txt
+*cookie*.txt
+
+# ==== 日志 / 数据库缓存 ====
+*.log
+logs/
+log/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ==== 运行期状态 / 配置快照 ====
+*.state
+*final-config*
+runtime-config*
+container.config*
+*.bak
+*.bak-*
+*.orig
+*.old
+*.swp
+
+# ==== Android / Gradle / 构建产物（P1+ 用，先占位） ====
+.gradle/
+build/
+app/build/
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+!gradle/wrapper/gradle-wrapper.jar
+
+# ==== IDE / 编辑器 ====
+.idea/
+*.iml
+.vscode/
+*.kate-swp
+.DS_Store
+
+# ==== 系统 / 临时 ====
+*.tmp
+tmp/
+temp/
+*~
