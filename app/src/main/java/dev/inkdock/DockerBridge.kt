@@ -9,12 +9,18 @@ import java.util.concurrent.TimeUnit
 object CommandPolicy {
     fun validId(id: String) = id.matches(Regex("[a-f0-9]{12,64}"))
     fun command(operation: String, id: String? = null): String {
-        val prefix = "/data/local/Droidspaces/bin/droidspaces --name=arch run -- /usr/bin/docker "
+        val runtime = "/data/local/Droidspaces/bin/droidspaces --name=arch "
+        if (operation == "info") return runtime + "--format info"
+        if (operation == "sockets") return runtime + "run -- /usr/bin/ss -H -lntup"
+        val prefix = runtime + "run -- /usr/bin/docker "
         return prefix + when (operation) {
             "list" -> "ps -a --no-trunc --format '{{json .}}'"
-            "logs", "start", "stop" -> {
+            "stats" -> "stats --no-stream --no-trunc --format '{{json .}}'"
+            "logs", "start", "stop", "top", "inspect" -> {
                 require(id != null && validId(id)) { "Invalid container ID" }
                 when (operation) {
+                    "top" -> "top $id -eo pid"
+                    "inspect" -> "inspect --format '{{json .HostConfig.NetworkMode}}|{{json .NetworkSettings.Ports}}' $id"
                     "logs" -> "logs --tail 150 --timestamps $id"
                     "stop" -> "stop --time 10 $id"
                     else -> "start $id"
@@ -26,6 +32,11 @@ object CommandPolicy {
 }
 
 data class Service(val id: String, val name: String, val state: String, val status: String, val ports: String)
+
+data class ContainerStats(val cpu: String, val memory: String, val memoryPercent: String, val netIO: String, val blockIO: String, val pids: String)
+
+data class Endpoint(val address: String, val protocol: String, val source: String)
+data class NetworkDetail(val mode: String, val endpoints: List<Endpoint>, val warning: String? = null)
 
 class DockerBridge {
     private suspend fun execute(operation: String, id: String? = null): String = withContext(Dispatchers.IO) {
@@ -75,6 +86,50 @@ class DockerBridge {
             check(CommandPolicy.validId(id)) { "Docker 返回无效 ID" }
             Service(id, j.getString("Names"), j.optString("State"), j.optString("Status"), j.optString("Ports"))
         }
+    }
+    suspend fun stats(): Map<String, ContainerStats> = execute("stats").lineSequence()
+        .filter { it.isNotBlank() }.associate { line ->
+            val j = JSONObject(line)
+            val id = j.getString("ID")
+            check(CommandPolicy.validId(id)) { "资源数据 ID 无效" }
+            id to ContainerStats(j.optString("CPUPerc"), j.optString("MemUsage"), j.optString("MemPerc"), j.optString("NetIO"), j.optString("BlockIO"), j.optString("PIDs"))
+        }
+
+    suspend fun network(id: String): NetworkDetail {
+        val parts = execute("inspect", id).trim().split('|', limit = 2)
+        val mode = parts[0].trim('"')
+        val info = JSONObject(execute("info"))
+        val runtimeIp = info.optString("nat_ip").takeIf { it.matches(Regex("[0-9.]+")) }
+            ?: return NetworkDetail(mode, emptyList(), "未获得运行时 NAT 地址，未猜测访问地址")
+        if (mode == "host") {
+            val pids = execute("top", id).lineSequence().map { it.trim() }.filter { it.matches(Regex("[0-9]+")) }.toSet()
+            val endpoints = execute("sockets").lineSequence().mapNotNull { line ->
+                val owners = Regex("pid=([0-9]+)").findAll(line).map { it.groupValues[1] }.toSet()
+                if (owners.intersect(pids).isEmpty()) return@mapNotNull null
+                val cols = line.trim().split(Regex("\\s+"))
+                if (cols.size < 5) return@mapNotNull null
+                val bind = cols[4]
+                val port = bind.substringAfterLast(':').toIntOrNull() ?: return@mapNotNull null
+                val host = bind.substringBeforeLast(':').removePrefix("[").removeSuffix("]")
+                if (host != "0.0.0.0" && host != "*" && host != "::" && host != runtimeIp) return@mapNotNull null
+                Endpoint("$runtimeIp:$port", cols[0], "进程归属匹配 · 实际监听")
+            }.distinct().toList()
+            return NetworkDetail(mode, endpoints, "仅列匹配容器进程且绑定运行时可访问地址的监听；未做连接探测。HTTP 协议需自行确认。")
+        }
+        val ports = JSONObject(parts.getOrElse(1) { "{}" }.takeUnless { it == "null" } ?: "{}")
+        val endpoints = mutableListOf<Endpoint>()
+        for (key in ports.keys()) {
+            val bindings = ports.optJSONArray(key) ?: continue
+            for (i in 0 until bindings.length()) {
+                val binding = bindings.getJSONObject(i)
+                val host = binding.optString("HostIp")
+                val port = binding.optString("HostPort").toIntOrNull() ?: continue
+                if (host == "0.0.0.0" || host == "::" || host == runtimeIp) {
+                    endpoints += Endpoint("$runtimeIp:$port", key.substringAfter('/'), "Docker 发布 · $key")
+                }
+            }
+        }
+        return NetworkDetail(mode, endpoints.distinct(), "发布记录不等于业务健康；仅回环绑定不冒充宿主可达。")
     }
     suspend fun logs(id: String) = execute("logs", id)
     suspend fun change(id: String, start: Boolean) { execute(if (start) "start" else "stop", id) }

@@ -1,11 +1,17 @@
 package dev.inkdock
 
 import android.os.Bundle
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.ui.platform.LocalContext
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -23,6 +29,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 
 class DockModel : ViewModel() {
     private val bridge = DockerBridge()
@@ -30,6 +41,23 @@ class DockModel : ViewModel() {
     var busy by mutableStateOf(false); private set
     var error by mutableStateOf<String?>(null); private set
     var log by mutableStateOf<String?>(null); private set
+    var stats by mutableStateOf<Map<String, ContainerStats>>(emptyMap()); private set
+    var statsError by mutableStateOf<String?>(null); private set
+    suspend fun updateStats() {
+        if (busy || services.isEmpty()) return
+        try { stats = bridge.stats(); statsError = null }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { statsError = e.message ?: "资源读取失败"; stats = emptyMap() }
+    }
+    var network by mutableStateOf<NetworkDetail?>(null); private set
+    var networkError by mutableStateOf<String?>(null); private set
+    fun network(service: Service) {
+        network = null; networkError = null
+        viewModelScope.launch {
+            try { network = bridge.network(service.id) }
+            catch (e: Exception) { networkError = e.message ?: "监听读取失败" }
+        }
+    }
     fun refresh() = run {
         if (busy) return@run
         viewModelScope.launch {
@@ -79,7 +107,22 @@ fun InkDock(model: DockModel = viewModel()) {
     var tab by remember { mutableIntStateOf(0) }
     var selected by remember { mutableStateOf<Service?>(null) }
     var confirmation by remember { mutableStateOf<Service?>(null) }
-    var showLog by remember { mutableStateOf(false) }
+    var logService by remember { mutableStateOf<Service?>(null) }
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner, tab) {
+        if (tab == 0 || tab == 1) lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) { model.updateStats(); delay(5000) }
+        }
+    }
+    val currentLog = logService
+    BackHandler(enabled = currentLog != null) { logService = null; model.clearLog() }
+    if (currentLog != null) {
+        LogScreen(currentLog.name, model.log, model.busy, model.error,
+            onRefresh = { model.logs(currentLog) },
+            onBack = { logService = null; model.clearLog() })
+        return
+    }
     val clipboard = LocalClipboardManager.current
     val tabs = listOf("概览", "服务", "网络", "文件")
     val icons = listOf(Icons.Default.Home, Icons.AutoMirrored.Filled.List, Icons.Default.Settings, Icons.Default.Folder)
@@ -95,6 +138,10 @@ fun InkDock(model: DockModel = viewModel()) {
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (model.busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
             model.error?.let { error -> item { Card { Text(error, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error) } } }
+            if (tab == 0 || tab == 1) {
+                item { Text("资源：前台每 5 秒采样 · 网络/磁盘为累计 I/O，不是速率", style = MaterialTheme.typography.labelSmall) }
+                model.statsError?.let { item { Text("资源读取失败：$it", color = MaterialTheme.colorScheme.error) } }
+            }
             when (tab) {
                 0 -> {
                     item { Text("你的本机运维台", style = MaterialTheme.typography.headlineMedium) }
@@ -111,11 +158,17 @@ fun InkDock(model: DockModel = viewModel()) {
                     item { Text("Docker 服务", style = MaterialTheme.typography.headlineMedium) }
                     if (model.services.isEmpty()) item { Text("暂无已读取数据。点击连接；若失败，查看上方错误。") }
                     items(model.services, key = { it.id }) { service ->
-                        Card(Modifier.fillMaxWidth().clickable { selected = service }) {
+                        Card(Modifier.fillMaxWidth().clickable { selected = service; model.network(service) }) {
                             Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Text(service.name, style = MaterialTheme.typography.titleMedium)
                                 Text(service.status)
-                                Text(service.ports.ifBlank { "无发布端口" }, style = MaterialTheme.typography.bodySmall)
+                                val usage = model.stats[service.id]
+                                if (usage != null) {
+                                    Text("CPU ${usage.cpu}  ·  内存 ${usage.memory} (${usage.memoryPercent})")
+                                    Text("网络 ${usage.netIO}  ·  磁盘 ${usage.blockIO}", style = MaterialTheme.typography.bodySmall)
+                                    Text("进程/线程 ${usage.pids}", style = MaterialTheme.typography.labelSmall)
+                                } else Text(if (service.state == "running") "资源数据待读取或不可用" else "未运行 · 无实时资源数据", style = MaterialTheme.typography.bodySmall)
+                                Text(service.ports.ifBlank { "未读取到 Docker 发布记录（不代表没有可访问端口）" }, style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -129,10 +182,32 @@ fun InkDock(model: DockModel = viewModel()) {
         AlertDialog(onDismissRequest = { selected = null }, title = { Text(service.name) }, text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(service.status)
-                Text(service.ports.ifBlank { "无发布端口" })
-                Text("端口为 Docker 原始映射，不代表 Android 宿主访问地址。", style = MaterialTheme.typography.bodySmall)
-                TextButton(onClick = { clipboard.setText(AnnotatedString(service.ports)) }) { Text("复制端口信息") }
-                TextButton(enabled = !model.busy, onClick = { model.logs(service); showLog = true; selected = null }) { Text("查看最近 150 行日志") }
+                model.stats[service.id]?.let { usage ->
+                    Text("CPU ${usage.cpu} · 内存 ${usage.memory} (${usage.memoryPercent})")
+                    Text("网络 ${usage.netIO} · 磁盘 ${usage.blockIO} · 进程/线程 ${usage.pids}", style = MaterialTheme.typography.bodySmall)
+                }
+                Text(service.ports.ifBlank { "未读取到 Docker 发布记录（不代表没有可访问端口）" })
+                model.networkError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                val detail = model.network
+                if (detail == null && model.networkError == null) Text("正在发现监听…")
+                detail?.let { network ->
+                    Text("网络模式：${network.mode}")
+                    if (network.endpoints.isEmpty()) Text("未发现可归属的宿主可访问监听；不代表服务没有端口。")
+                    Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
+                        network.endpoints.forEach { endpoint ->
+                            Text(endpoint.address, style = MaterialTheme.typography.titleSmall)
+                            Text("${endpoint.protocol} · ${endpoint.source}", style = MaterialTheme.typography.labelSmall)
+                            Row {
+                                TextButton(onClick = { clipboard.setText(AnnotatedString(endpoint.address)) }) { Text("复制地址") }
+                                if (endpoint.protocol == "tcp") TextButton(onClick = {
+                                    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://${endpoint.address}"))) }
+                                }) { Text("尝试 HTTP") }
+                            }
+                        }
+                    }
+                    network.warning?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                }
+                TextButton(enabled = !model.busy, onClick = { model.logs(service); logService = service; selected = null }) { Text("打开日志查看器") }
                 TextButton(enabled = !model.busy, onClick = { confirmation = service; selected = null }) { Text(if (service.state == "running") "停止容器…" else "启动容器…") }
             }
         }, confirmButton = { TextButton(onClick = { selected = null }) { Text("关闭") } })
@@ -143,7 +218,5 @@ fun InkDock(model: DockModel = viewModel()) {
             confirmButton = { TextButton(onClick = { model.change(service); confirmation = null }) { Text("确认执行") } },
             dismissButton = { TextButton(onClick = { confirmation = null }) { Text("取消") } })
     }
-    if (showLog) AlertDialog(onDismissRequest = { showLog = false; model.clearLog() }, title = { Text("日志 · 仅本机显示") },
-        text = { LazyColumn { item { Text(model.log ?: if (model.busy) "读取中…" else "未读取成功，请查看错误。") } } },
-        confirmButton = { TextButton(onClick = { showLog = false; model.clearLog() }) { Text("关闭并清除") } })
+
 }
