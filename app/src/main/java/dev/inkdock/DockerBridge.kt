@@ -15,6 +15,16 @@ object CommandPolicy {
         val prefix = runtime + "run -- /usr/bin/docker "
         return prefix + when (operation) {
             "list" -> "ps -a --no-trunc --format '{{json .}}'"
+            "images" -> "image ls --no-trunc --digests --format '{{json .}}'"
+            "pull" -> {
+                require(id != null && id.length <= 255 && id.matches(Regex("[a-zA-Z0-9][a-zA-Z0-9._/:@-]*"))) { "无效镜像引用" }
+                "image pull $id"
+            }
+            "image-users", "image-remove" -> {
+                require(id != null && id.matches(Regex("sha256:[a-f0-9]{64}"))) { "无效镜像 ID" }
+                if (operation == "image-users") "ps -a --filter ancestor=$id --format '{{.Names}}'"
+                else "image rm $id"
+            }
             "stats" -> "stats --no-stream --no-trunc --format '{{json .}}'"
             "logs", "start", "stop", "top", "inspect" -> {
                 require(id != null && validId(id)) { "Invalid container ID" }
@@ -32,6 +42,8 @@ object CommandPolicy {
 }
 
 data class Service(val id: String, val name: String, val state: String, val status: String, val ports: String)
+
+data class DockerImage(val id: String, val repository: String, val tag: String, val size: String, val created: String, val digest: String, val users: List<String>)
 
 data class ContainerStats(val cpu: String, val memory: String, val memoryPercent: String, val netIO: String, val blockIO: String, val pids: String)
 
@@ -63,7 +75,7 @@ class DockerBridge {
             }
         }.apply { isDaemon = true; start() }
         try {
-            check(process.waitFor(25, TimeUnit.SECONDS)) { "操作超时；服务端状态需刷新确认" }
+            check(process.waitFor(if (operation == "pull") 600 else 25, TimeUnit.SECONDS)) { "操作超时；服务端状态需刷新确认" }
             reader.join(1000)
             check(!reader.isAlive) { "输出读取未完成，请重试" }
             val text = synchronized(output) {
@@ -87,6 +99,19 @@ class DockerBridge {
             Service(id, j.getString("Names"), j.optString("State"), j.optString("Status"), j.optString("Ports"))
         }
     }
+    suspend fun images(): List<DockerImage> {
+        val rows = execute("images").lineSequence().filter { it.isNotBlank() }.map { JSONObject(it) }.toList()
+        val users = rows.map { it.getString("ID") }.distinct().associateWith { id ->
+            execute("image-users", id).lines().filter { it.isNotBlank() }
+        }
+        return rows.map { j -> DockerImage(j.getString("ID"), j.optString("Repository"), j.optString("Tag"), j.optString("Size"), j.optString("CreatedSince"), j.optString("Digest"), users[j.getString("ID")].orEmpty()) }
+    }
+    suspend fun pullImage(reference: String) { execute("pull", reference) }
+    suspend fun removeImage(id: String) {
+        check(execute("image-users", id).isBlank()) { "镜像仍被容器引用（包括已停止容器），拒绝删除" }
+        execute("image-remove", id)
+    }
+
     suspend fun stats(): Map<String, ContainerStats> = execute("stats").lineSequence()
         .filter { it.isNotBlank() }.associate { line ->
             val j = JSONObject(line)

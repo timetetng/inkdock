@@ -85,6 +85,23 @@ class DockModel : ViewModel() {
             finally { busy = false }
         }
     }
+    var images by mutableStateOf<List<DockerImage>>(emptyList()); private set
+    var imagesLoaded by mutableStateOf(false); private set
+    var imageBusy by mutableStateOf(false); private set
+    var imageError by mutableStateOf<String?>(null); private set
+    private fun imageAction(action: suspend () -> Unit = {}) {
+        if (imageBusy) return
+        imageBusy = true; imageError = null
+        viewModelScope.launch {
+            try { action(); images = bridge.images(); imagesLoaded = true }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { imageError = e.message ?: "镜像操作失败，请刷新确认实际状态" }
+            finally { imageBusy = false }
+        }
+    }
+    fun loadImages() = imageAction()
+    fun pullImage(reference: String) = imageAction { bridge.pullImage(reference) }
+    fun removeImage(id: String) = imageAction { bridge.removeImage(id) }
     fun clearLog() { log = null }
 }
 
@@ -124,18 +141,20 @@ fun InkDock(model: DockModel = viewModel()) {
         return
     }
     val clipboard = LocalClipboardManager.current
-    val tabs = listOf("概览", "服务", "网络", "文件")
-    val icons = listOf(Icons.Default.Home, Icons.AutoMirrored.Filled.List, Icons.Default.Settings, Icons.Default.Folder)
+    LaunchedEffect(tab) { if (tab == 2 && !model.imagesLoaded) model.loadImages() }
+    val tabs = listOf("概览", "服务", "镜像", "网络", "文件")
+    val icons = listOf(Icons.Default.Home, Icons.AutoMirrored.Filled.List, Icons.Default.Storage, Icons.Default.Settings, Icons.Default.Folder)
     Scaffold(
         topBar = { TopAppBar(title = { Text("墨台 · ${tabs[tab]}") }, actions = {
-            TextButton(onClick = { model.refresh() }, enabled = !model.busy) { Text("连接 / 刷新") }
+            TextButton(onClick = { if (tab == 2) model.loadImages() else model.refresh() }, enabled = !model.busy && !model.imageBusy) { Text("连接 / 刷新") }
         }) },
         bottomBar = { NavigationBar { tabs.forEachIndexed { index, title ->
             NavigationBarItem(selected = tab == index, onClick = { tab = index },
                 icon = { Icon(icons[index], contentDescription = title) }, label = { Text(title) })
         } } }
     ) { padding ->
-        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (tab == 2) ImageScreen(model, Modifier.padding(padding))
+        else LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (model.busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
             model.error?.let { error -> item { Card { Text(error, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error) } } }
             if (tab == 0 || tab == 1) {
@@ -152,7 +171,7 @@ fun InkDock(model: DockModel = viewModel()) {
                         Text("运行中 ${model.services.count { it.state == "running" }}")
                         Text("点击右上角连接，读取真实状态。未连接不代表没有服务。", style = MaterialTheme.typography.bodySmall)
                     } } }
-                    item { Text("资源监控、mihomo 与扩展安装尚未实现。", style = MaterialTheme.typography.bodySmall) }
+                    item { Text("资源指标来自 Docker；受内核限制可能不可用。mihomo 与扩展安装尚未实现。", style = MaterialTheme.typography.bodySmall) }
                 }
                 1 -> {
                     item { Text("Docker 服务", style = MaterialTheme.typography.headlineMedium) }
@@ -173,8 +192,8 @@ fun InkDock(model: DockModel = viewModel()) {
                         }
                     }
                 }
-                2 -> item { Text("网络", style = MaterialTheme.typography.headlineMedium); Text("监听发现、宿主转发与代理管理尚未接入。本版不会修改网络配置。") }
-                3 -> item { Text("文件", style = MaterialTheme.typography.headlineMedium); Text("容器文件浏览尚未接入。本版不会挂载镜像或修改文件。") }
+                3 -> item { Text("网络", style = MaterialTheme.typography.headlineMedium); Text("监听发现、宿主转发与代理管理尚未接入。本版不会修改网络配置。") }
+                4 -> item { Text("文件", style = MaterialTheme.typography.headlineMedium); Text("容器文件浏览尚未接入。本版不会挂载镜像或修改文件。") }
             }
         }
     }
