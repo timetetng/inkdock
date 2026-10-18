@@ -10,6 +10,8 @@ object CommandPolicy {
     fun validId(id: String) = id.matches(Regex("[a-f0-9]{12,64}"))
     fun command(operation: String, id: String? = null): String {
         val runtime = "/data/local/Droidspaces/bin/droidspaces --name=arch "
+        if (operation == "runtime-processes") return runtime + "run -- /usr/bin/ps -e -o cputimes=,rss=,nlwp="
+        if (operation == "runtime-disk") return runtime + "run -- /usr/bin/df -B1 --output=size,used,avail,pcent /"
         if (operation == "info") return runtime + "--format info"
         if (operation == "sockets") return runtime + "run -- /usr/bin/ss -H -lntup"
         val prefix = runtime + "run -- /usr/bin/docker "
@@ -26,9 +28,10 @@ object CommandPolicy {
                 else "image rm $id"
             }
             "stats" -> "stats --no-stream --no-trunc --format '{{json .}}'"
-            "logs", "start", "stop", "top", "inspect" -> {
+            "logs", "start", "stop", "top", "usage", "inspect" -> {
                 require(id != null && validId(id)) { "Invalid container ID" }
                 when (operation) {
+                    "usage" -> "top $id -eo pid,rss,nlwp"
                     "top" -> "top $id -eo pid"
                     "inspect" -> "inspect --format '{{json .HostConfig.NetworkMode}}|{{json .NetworkSettings.Ports}}' $id"
                     "logs" -> "logs --tail 150 --timestamps $id"
@@ -89,6 +92,16 @@ class DockerBridge {
             if (process.isAlive) process.destroyForcibly()
         }
     }
+    suspend fun runtimeSample(): RuntimeSample {
+        val rows = execute("runtime-processes").lineSequence().map { it.trim().split(Regex("\\s+")) }.filter { it.size == 3 }.toList()
+        check(rows.isNotEmpty()) { "运行时进程列表为空" }
+        return RuntimeSample(android.os.SystemClock.elapsedRealtime(), rows.sumOf { it[0].toLong() }, rows.sumOf { it[1].toLong() } * 1024, rows.size, rows.sumOf { it[2].toLong() })
+    }
+    suspend fun runtimeDisk(): String {
+        val cols = execute("runtime-disk").trim().lines().last().trim().split(Regex("\\s+"))
+        check(cols.size == 4) { "磁盘统计格式异常" }
+        return "已用 ${formatBytes(cols[1].toLong())} / ${formatBytes(cols[0].toLong())} · ${cols[3]}\n可用 ${formatBytes(cols[2].toLong())}"
+    }
     suspend fun list(): List<Service> {
         val lines = execute("list").lineSequence().filter { it.isNotBlank() }.toList()
         return lines.map {
@@ -112,7 +125,8 @@ class DockerBridge {
         execute("image-remove", id)
     }
 
-    suspend fun stats(): Map<String, ContainerStats> = execute("stats").lineSequence()
+    suspend fun stats(): Map<String, ContainerStats> {
+        val result = execute("stats").lineSequence()
         .filter { it.isNotBlank() }.associate { line ->
             val j = JSONObject(line)
             val id = j.getString("ID")
@@ -124,7 +138,15 @@ class DockerBridge {
                 if (j.optString("NetIO").replace(" ", "") == "0B/0B") "未报告（非真实零值）" else j.optString("NetIO"),
                 if (j.optString("BlockIO").replace(" ", "") == "0B/0B") "未报告（非真实零值）" else j.optString("BlockIO"),
                 j.optString("PIDs").takeUnless { it == "0" }.orEmpty().ifBlank { "不可用" })
+        }.toMutableMap()
+        for ((id, value) in result.toMap()) {
+            val rows = execute("usage", id).lineSequence().drop(1).map { it.trim().split(Regex("\\s+")) }.filter { it.size == 3 && it[1].toLongOrNull() != null }.toList()
+            if (rows.isNotEmpty()) result[id] = value.copy(
+                memory = "${formatBytes(rows.sumOf { it[1].toLong() } * 1024)} RSS",
+                memoryPercent = "共享页可能重复", pids = "${rows.size} / ${rows.sumOf { it[2].toLong() }}")
         }
+        return result
+    }
 
     suspend fun network(id: String): NetworkDetail {
         val parts = execute("inspect", id).trim().split('|', limit = 2)

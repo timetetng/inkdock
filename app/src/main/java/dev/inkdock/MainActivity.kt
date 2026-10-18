@@ -43,6 +43,25 @@ class DockModel : ViewModel() {
     var log by mutableStateOf<String?>(null); private set
     var stats by mutableStateOf<Map<String, ContainerStats>>(emptyMap()); private set
     var statsError by mutableStateOf<String?>(null); private set
+    var runtimeSample by mutableStateOf<RuntimeSample?>(null); private set
+    var runtimeCpu by mutableStateOf("等待第二次采样"); private set
+    var runtimeDisk by mutableStateOf<String?>(null); private set
+    var runtimeError by mutableStateOf<String?>(null); private set
+    private var diskUpdated = 0L
+    suspend fun updateRuntime() {
+        try {
+            val next = bridge.runtimeSample()
+            val previous = runtimeSample
+            runtimeCpu = if (previous != null && next.timeMs > previous.timeMs && next.cpuSeconds >= previous.cpuSeconds)
+                java.lang.String.format(java.util.Locale.US, "%.1f%%", (next.cpuSeconds - previous.cpuSeconds) * 100000.0 / (next.timeMs - previous.timeMs)) else "等待有效时间差"
+            runtimeSample = next
+            if (runtimeDisk == null || next.timeMs - diskUpdated >= 60000) {
+                runtimeDisk = bridge.runtimeDisk(); diskUpdated = next.timeMs
+            }
+            runtimeError = null
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { runtimeError = e.message ?: "运行时采样失败" }
+    }
     suspend fun updateStats() {
         if (busy || services.isEmpty()) return
         try { stats = bridge.stats(); statsError = null }
@@ -147,7 +166,7 @@ fun InkDock(model: DockModel = viewModel()) {
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(lifecycleOwner, tab) {
         if (tab == 0 || tab == 1) lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            while (true) { model.updateStats(); delay(5000) }
+            while (true) { if (tab == 0) model.updateRuntime() else model.updateStats(); delay(5000) }
         }
     }
     val currentLog = logService
@@ -176,12 +195,12 @@ fun InkDock(model: DockModel = viewModel()) {
             if (model.busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
             model.error?.let { error -> item { Card { Text(error, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error) } } }
             if (tab == 0 || tab == 1) {
-                item { Text("资源：前台每 5 秒采样 · 网络/磁盘为累计 I/O，不是速率", style = MaterialTheme.typography.labelSmall) }
+                item { Text("资源：前台每 5 秒采样 · CPU / 内存", style = MaterialTheme.typography.labelSmall) }
                 model.statsError?.let { item { Text("资源读取失败：$it", color = MaterialTheme.colorScheme.error) } }
             }
             when (tab) {
                 0 -> {
-                    item { Text("你的本机运维台", style = MaterialTheme.typography.headlineMedium) }
+                    item { RuntimeDashboard(model) }
                     item { Text("P1 开发版 · 按需申请 root，不自动操作现有服务。") }
                     item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(20.dp)) {
                         Text("Docker", style = MaterialTheme.typography.titleLarge)
@@ -189,7 +208,7 @@ fun InkDock(model: DockModel = viewModel()) {
                         Text("运行中 ${model.services.count { it.state == "running" }}")
                         Text("点击右上角连接，读取真实状态。未连接不代表没有服务。", style = MaterialTheme.typography.bodySmall)
                     } } }
-                    item { Text("资源指标来自 Docker；受内核限制可能不可用。mihomo 与扩展安装尚未实现。", style = MaterialTheme.typography.bodySmall) }
+
                 }
                 1 -> {
                     item { Text("Docker 服务", style = MaterialTheme.typography.headlineMedium) }
@@ -202,7 +221,6 @@ fun InkDock(model: DockModel = viewModel()) {
                                 val usage = model.stats[service.id]
                                 if (usage != null) {
                                     Text("CPU ${usage.cpu}  ·  内存 ${usage.memory} (${usage.memoryPercent})")
-                                    Text("网络 ${usage.netIO}  ·  磁盘 ${usage.blockIO}", style = MaterialTheme.typography.bodySmall)
                                     Text("进程/线程 ${usage.pids}", style = MaterialTheme.typography.labelSmall)
                                 } else Text(if (service.state == "running") "资源数据待读取或不可用" else "未运行 · 无实时资源数据", style = MaterialTheme.typography.bodySmall)
                                 val net = model.networks[service.id]
@@ -226,7 +244,7 @@ fun InkDock(model: DockModel = viewModel()) {
                 Text(service.status)
                 model.stats[service.id]?.let { usage ->
                     Text("CPU ${usage.cpu} · 内存 ${usage.memory} (${usage.memoryPercent})")
-                    Text("网络 ${usage.netIO} · 磁盘 ${usage.blockIO} · 进程/线程 ${usage.pids}", style = MaterialTheme.typography.bodySmall)
+                    Text("进程/线程 ${usage.pids}", style = MaterialTheme.typography.bodySmall)
                 }
 
                 model.networkErrors[service.id]?.let { Text(it, color = MaterialTheme.colorScheme.error) }
