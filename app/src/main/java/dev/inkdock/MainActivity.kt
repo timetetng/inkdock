@@ -49,20 +49,38 @@ class DockModel : ViewModel() {
         catch (e: CancellationException) { throw e }
         catch (e: Exception) { statsError = e.message ?: "资源读取失败"; stats = emptyMap() }
     }
+    var networks by mutableStateOf<Map<String, NetworkDetail>>(emptyMap()); private set
+    var networkErrors by mutableStateOf<Map<String, String>>(emptyMap()); private set
     var network by mutableStateOf<NetworkDetail?>(null); private set
     var networkError by mutableStateOf<String?>(null); private set
     fun network(service: Service) {
-        network = null; networkError = null
+        network = networks[service.id]; networkError = networkErrors[service.id]
         viewModelScope.launch {
-            try { network = bridge.network(service.id) }
-            catch (e: Exception) { networkError = e.message ?: "监听读取失败" }
+            try {
+                val result = bridge.network(service.id)
+                networks = networks + (service.id to result)
+                networkErrors = networkErrors - service.id
+                network = result; networkError = null
+            }
+            catch (e: Exception) {
+                val message = e.message ?: "监听读取失败"
+                networkErrors = networkErrors + (service.id to message)
+                networkError = message
+            }
         }
     }
     fun refresh() = run {
         if (busy) return@run
         viewModelScope.launch {
             busy = true; error = null
-            try { services = bridge.list() } catch (e: Exception) { error = e.message ?: "读取失败" }
+            try {
+                services = bridge.list()
+                networks = emptyMap(); networkErrors = emptyMap()
+                for (service in services.filter { it.state == "running" }) {
+                    try { networks = networks + (service.id to bridge.network(service.id)) }
+                    catch (e: Exception) { networkErrors = networkErrors + (service.id to (e.message ?: "监听读取失败")) }
+                }
+            } catch (e: Exception) { error = e.message ?: "读取失败" }
             finally { busy = false }
         }
     }
@@ -187,7 +205,12 @@ fun InkDock(model: DockModel = viewModel()) {
                                     Text("网络 ${usage.netIO}  ·  磁盘 ${usage.blockIO}", style = MaterialTheme.typography.bodySmall)
                                     Text("进程/线程 ${usage.pids}", style = MaterialTheme.typography.labelSmall)
                                 } else Text(if (service.state == "running") "资源数据待读取或不可用" else "未运行 · 无实时资源数据", style = MaterialTheme.typography.bodySmall)
-                                Text(service.ports.ifBlank { "未读取到 Docker 发布记录（不代表没有可访问端口）" }, style = MaterialTheme.typography.bodySmall)
+                                val net = model.networks[service.id]
+                                if (net != null) {
+                                    Text("网络：${net.mode}", style = MaterialTheme.typography.labelSmall)
+                                    net.endpoints.forEach { endpoint -> Text("${endpoint.protocol} ${endpoint.address}${if (endpoint.runtimeOnly) " · 运行时回环" else ""}", style = MaterialTheme.typography.bodySmall) }
+                                    if (net.endpoints.isEmpty()) Text("未发现监听或发布记录", style = MaterialTheme.typography.bodySmall)
+                                } else Text(model.networkErrors[service.id] ?: if (service.state == "running") "监听待读取" else "未运行", style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -205,20 +228,20 @@ fun InkDock(model: DockModel = viewModel()) {
                     Text("CPU ${usage.cpu} · 内存 ${usage.memory} (${usage.memoryPercent})")
                     Text("网络 ${usage.netIO} · 磁盘 ${usage.blockIO} · 进程/线程 ${usage.pids}", style = MaterialTheme.typography.bodySmall)
                 }
-                Text(service.ports.ifBlank { "未读取到 Docker 发布记录（不代表没有可访问端口）" })
-                model.networkError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                val detail = model.network
+
+                model.networkErrors[service.id]?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                val detail = model.networks[service.id]
                 if (detail == null && model.networkError == null) Text("正在发现监听…")
                 detail?.let { network ->
                     Text("网络模式：${network.mode}")
-                    if (network.endpoints.isEmpty()) Text("未发现可归属的宿主可访问监听；不代表服务没有端口。")
+                    if (network.endpoints.isEmpty()) Text("未发现监听或发布记录。")
                     Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
                         network.endpoints.forEach { endpoint ->
                             Text(endpoint.address, style = MaterialTheme.typography.titleSmall)
                             Text("${endpoint.protocol} · ${endpoint.source}", style = MaterialTheme.typography.labelSmall)
                             Row {
                                 TextButton(onClick = { clipboard.setText(AnnotatedString(endpoint.address)) }) { Text("复制地址") }
-                                if (endpoint.protocol == "tcp") TextButton(onClick = {
+                                if (endpoint.protocol == "tcp" && !endpoint.runtimeOnly) TextButton(onClick = {
                                     runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://${endpoint.address}"))) }
                                 }) { Text("尝试 HTTP") }
                             }

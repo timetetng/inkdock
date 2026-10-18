@@ -47,7 +47,7 @@ data class DockerImage(val id: String, val repository: String, val tag: String, 
 
 data class ContainerStats(val cpu: String, val memory: String, val memoryPercent: String, val netIO: String, val blockIO: String, val pids: String)
 
-data class Endpoint(val address: String, val protocol: String, val source: String)
+data class Endpoint(val address: String, val protocol: String, val source: String, val runtimeOnly: Boolean = false)
 data class NetworkDetail(val mode: String, val endpoints: List<Endpoint>, val warning: String? = null)
 
 class DockerBridge {
@@ -117,7 +117,13 @@ class DockerBridge {
             val j = JSONObject(line)
             val id = j.getString("ID")
             check(CommandPolicy.validId(id)) { "资源数据 ID 无效" }
-            id to ContainerStats(j.optString("CPUPerc"), j.optString("MemUsage"), j.optString("MemPerc"), j.optString("NetIO"), j.optString("BlockIO"), j.optString("PIDs"))
+            val memory = j.optString("MemUsage")
+            val memoryUnavailable = memory.replace(" ", "") == "0B/0B"
+            id to ContainerStats(j.optString("CPUPerc"), if (memoryUnavailable) "不可用" else memory,
+                if (memoryUnavailable) "不可用" else j.optString("MemPerc"),
+                if (j.optString("NetIO").replace(" ", "") == "0B/0B") "未报告（非真实零值）" else j.optString("NetIO"),
+                if (j.optString("BlockIO").replace(" ", "") == "0B/0B") "未报告（非真实零值）" else j.optString("BlockIO"),
+                j.optString("PIDs").takeUnless { it == "0" }.orEmpty().ifBlank { "不可用" })
         }
 
     suspend fun network(id: String): NetworkDetail {
@@ -136,10 +142,12 @@ class DockerBridge {
                 val bind = cols[4]
                 val port = bind.substringAfterLast(':').toIntOrNull() ?: return@mapNotNull null
                 val host = bind.substringBeforeLast(':').removePrefix("[").removeSuffix("]")
-                if (host != "0.0.0.0" && host != "*" && host != "::" && host != runtimeIp) return@mapNotNull null
-                Endpoint("$runtimeIp:$port", cols[0], "进程归属匹配 · 实际监听")
+                val loopback = host == "127.0.0.1" || host == "::1"
+                val wildcard = host == "0.0.0.0" || host == "*" || host == "::"
+                val addressHost = if (wildcard) runtimeIp else host
+                Endpoint("${if (addressHost.contains(':')) "[$addressHost]" else addressHost}:$port", cols[0], if (loopback) "运行时回环监听 · 非 Android localhost" else "进程归属匹配 · 实际监听", loopback)
             }.distinct().toList()
-            return NetworkDetail(mode, endpoints, "仅列匹配容器进程且绑定运行时可访问地址的监听；未做连接探测。HTTP 协议需自行确认。")
+            return NetworkDetail(mode, endpoints, "列出容器进程的实际监听；回环地址属于 Droidspaces 运行时，不等于 Android 回环。未探测连通性或识别 HTTP。")
         }
         val ports = JSONObject(parts.getOrElse(1) { "{}" }.takeUnless { it == "null" } ?: "{}")
         val endpoints = mutableListOf<Endpoint>()
